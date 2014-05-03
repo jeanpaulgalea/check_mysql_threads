@@ -1,0 +1,180 @@
+#!/bin/sh
+
+# Nagios plugin for MySQL.
+#
+# Check the MySQL processlist for long running threads.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+
+PROGNAME=`basename "$0"`
+PROGPATH=`echo "$0" | sed -e 's,[\\/][^\\/][^\\/]*$,,'`
+REVISION="1.0"
+
+MYSQL=${MYSQL:-mysql}
+
+. $PROGPATH/utils.sh
+
+print_usage() {
+	echo "Usage:"
+	echo " $PROGNAME --defaults-file FILE -w SECONDS -c SECONDS"
+	echo " $PROGNAME --help"
+	echo " $PROGNAME --version"
+}
+
+print_help() {
+	echo "$PROGNAME v$REVISION"
+	echo ""
+	echo "Check the MySQL processlist for long running threads."
+	echo ""
+	print_usage
+	echo ""
+	echo "Options:"
+	echo " -h, --help"
+	echo "    Print detailed help screen"
+	echo ""
+	echo " -V, --version"
+	echo "    Print version information"
+	echo ""
+	echo " --defaults-file FILE"
+	echo "    Read mysql options from the given file"
+	echo ""
+	echo " -w SECONDS"
+	echo "    Exit with WARNING status if threads running longer than SECONDS are found"
+	echo ""
+	echo " -c SECONDS"
+	echo "    Exit with CRITICAL status if threads running longer than SECONDS are found"
+	echo ""
+	echo "Notes:"
+	echo " This plugin only supports MySQL server 5.1.7 or later,"
+	echo " as it queries the INFORMATION_SCHEMA PROCESSLIST table."
+	echo ""
+	echo " The given MySQL user must be granted the PROCESS privilege,"
+	echo " otherwise only threads owned by that user are considered."
+	echo ""
+	echo " Threads executing the following commands will be ignored by the plugin,"
+	echo " as they can be very long lived;"
+	echo ""
+	echo "   Binlog Dump"
+	echo "    This is a thread on a master server for sending"
+	echo "    binary log contents to a slave server."
+	echo ""
+	echo "   Connect"
+	echo "    A replication slave is connected to its master."
+	echo ""
+	echo "   Sleep"
+	echo "    The thread is waiting for the client to send"
+	echo "    a new statement to it (persistent connection)."
+	echo ""
+	echo "Send email to jp@galea.se if you have questions, patches or suggestions."
+}
+
+if [ $# -lt 1 ] ; then
+	print_usage
+	exit $STATE_UNKNOWN
+fi
+
+while test -n "$1"; do
+	case "$1" in
+		--help)
+			print_help
+			exit $STATE_OK
+			;;
+		-h)
+			print_help
+			exit $STATE_OK
+			;;
+		--version)
+			echo "$PROGNAME v$REVISION"
+			exit $STATE_OK
+			;;
+		-V)
+			echo "$PROGNAME v$REVISION"
+			exit $STATE_OK
+			;;
+		--defaults-file)
+			defaultsfile=$2
+			shift
+			;;
+		-c)
+			scrit=$2
+			shift
+			;;
+		-w)
+			swarn=$2
+			shift
+			;;
+		*)
+			echo "Unknown argument: $1"
+			print_usage
+			exit $STATE_UNKNOWN
+			;;
+	esac
+	shift
+done
+
+# empty arguments
+
+if [ -z "$defaultsfile" -o -z "$scrit" -o -z "$swarn" ] ; then
+	print_usage
+	exit $STATE_UNKNOWN
+fi
+
+# defaults file must be readable
+
+if [ ! -f "$defaultsfile" ] ; then
+	echo "$PROGNAME error: defaults file does not exist!"
+	exit $STATE_UNKNOWN
+fi
+
+if [ ! -r "$defaultsfile" ] ; then
+	echo "$PROGNAME error: defaults file is not readable!"
+	exit $STATE_UNKNOWN
+fi
+
+# only accept integer thresholds.
+#
+# especially important once these values are plugged into SQL,
+#	otherwise we would be vulnerable to SQL injection.
+
+if [ -n "`echo "$scrit" | tr -d "[0-9]"`" ] ; then
+	echo "$PROGNAME error: critical threshold must be a positive integer!"
+	exit $STATE_UNKNOWN
+fi
+
+if [ -n "`echo "$swarn" | tr -d "[0-9]"`" ] ; then
+	echo "$PROGNAME error: warning threshold must be a positive integer!"
+	exit $STATE_UNKNOWN
+fi
+
+result=`$MYSQL --defaults-file="$defaultsfile" --batch -ss <<EOF 2>/dev/null
+SELECT IFNULL(SUM(IF(TIME > ${scrit}, 1, 0)), 0) as crit,
+       IFNULL(SUM(IF(TIME > ${swarn}, 1, 0)), 0) as warn
+FROM information_schema.PROCESSLIST
+WHERE COMMAND NOT IN ('Binlog Dump','Connect','Sleep')
+EOF
+`
+
+# failed or empty result
+
+if [ $? -ne 0 -o -z "$result" ] ; then
+	echo "UNK - could not retrieve MySQL processlist"
+	exit $STATE_UNKNOWN
+fi
+
+# explode columns
+
+tcrit=`echo "$result" | cut -f1`
+twarn=`echo "$result" | cut -f2`
+
+if [ $tcrit -gt 0 ] ; then
+	echo "CRIT - $tcrit threads running for longer than $scrit seconds!"
+	exit $STATE_CRITICAL
+fi
+
+if [ $twarn -gt 0 ] ; then
+	echo "WARN - $twarn threads running for longer than $swarn seconds!"
+	exit $STATE_WARNING
+fi
+
+echo "OK - no long running threads"
+exit $STATE_OK
